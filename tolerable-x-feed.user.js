@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Tolerable X Feed
 // @namespace    https://github.com/nikkoxgonzales
-// @version      2.0.0
-// @description  Makes your X/Twitter feed tolerable: hides engagement bait, promo posts and paid ads, using TypeSafe's Jev decision model via OpenRouter.
+// @version      2.2.0
+// @description  Makes your X/Twitter feed tolerable: hides engagement bait, promo posts and paid ads, using TypeSafe's Jev decision model (OpenRouter, TypeSafe, or self-hosted).
 // @author       nikkoxgonzales
 // @homepageURL  https://github.com/nikkoxgonzales/tolerable-x-feed
 // @supportURL   https://github.com/nikkoxgonzales/tolerable-x-feed/issues
@@ -18,6 +18,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_addStyle
 // @connect      openrouter.ai
+// @connect      api.typesafe.ai
+// @connect      *
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -26,14 +28,35 @@
 
   // ---------- config ----------
   const APP = 'Tolerable X Feed';
-  const API_URL = 'https://openrouter.ai/api/alpha/decisions';
-  const MODEL = 'typesafe/jev-1.13';
-  const BATCH_SIZE = 8;          // posts per Jev request (tested: batching does not hurt accuracy)
+  // All three speak the same System One request shape: { model, state, questions } -> { answers, usage }
+  const PROVIDERS = {
+    openrouter: {
+      label: 'OpenRouter',
+      url: 'https://openrouter.ai/api/alpha/decisions',
+      model: 'typesafe/jev-1.13',
+      keyHint: 'sk-or-…',
+      keyLink: 'https://openrouter.ai/settings/keys',
+    },
+    typesafe: {
+      label: 'TypeSafe',
+      url: 'https://api.typesafe.ai/v1/systemone',
+      model: 'jev-latest',
+      keyHint: 'TypeSafe API key',
+      keyLink: 'https://typesafe.ai',
+    },
+    custom: {
+      label: 'Custom / self-hosted',
+      url: '',
+      model: 'jev-1.13',
+      keyHint: 'Bearer token (optional)',
+    },
+  };
+  const BATCH_SIZE = 16;         // posts per request; tested up to 16 with no accuracy loss
   const FLUSH_DELAY_MS = 350;    // wait this long to fill a batch while scrolling
   const MAX_IN_FLIGHT = 2;
   const MAX_CHARS = 1000;
   const MIN_CHARS = 8;
-  const CACHE_KEY = 'cache_v2';  // bump when the question set changes
+  const CACHE_KEY = 'cache_v3';  // bump when the question set changes
   const CACHE_MAX = 4000;
 
   // Few-shot examples, taken from twitter-bait-questions.txt
@@ -48,8 +71,10 @@
     "What's a software engineering opinion that would get you ratioed but you still believe?",
   ];
 
-  // Every AI filter is one Jev "noul" (yes/no probability) question per post.
-  // All of them are asked for every post so cached scores stay complete when you toggle filters.
+  // Each AI filter is one Jev "noul" (yes/no probability) question per post. The definition is sent
+  // once per request in state.definitions and every question just points at it: 3x fewer tokens than
+  // repeating it in each question, with the same accuracy (see README "Efficiency").
+  // All filters are asked for every post so cached scores stay complete when you toggle filters.
   const FILTERS = {
     ad: {
       label: 'Ad',
@@ -60,42 +85,35 @@
       label: 'Bait',
       desc: '"Name one…", "You wake up in 1999…", "Be honest:…" reply farming.',
       ai: true,
-      question: (k) => ({
-        type: 'noul',
-        instructions:
-          `Is the text of \`${k}\` engagement bait: a generic, open-ended prompt (hypothetical, "name one", ` +
-          `"would you rather", "be honest", hot-take poll, "what's the most overrated...") written mainly ` +
-          `to farm replies and impressions, in the style of \`examples_of_bait\`?`,
-        criteria: {
-          true: 'The post is a broad question or prompt aimed at the whole audience to bait replies, opinions, or debate, without sharing real information or asking for specific help.',
-          false: 'The post shares news, work, an announcement, a personal update, a joke, or asks a specific, genuine question someone needs answered.',
-        },
-      }),
+      term: 'engagement_bait',
+      definition: {
+        means: 'A generic, open-ended prompt aimed at the whole audience (hypothetical, "name one", "would you rather", "be honest", hot-take poll, "what\'s the most overrated...") written mainly to farm replies, opinions, or debate, without sharing real information or asking for specific help.',
+        is_not: 'News, work, an announcement, a personal update, a joke, or a specific, genuine question someone needs answered.',
+        examples: BAIT_EXAMPLES,
+      },
     },
     promo: {
       label: 'Promo',
       desc: 'Product launches, pricing, discount codes, webinars, "try it now" links.',
       ai: true,
-      question: (k) => ({
-        type: 'noul',
-        instructions:
-          `Is \`${k}\` promotional marketing: the author advertising a product, service, launch, feature release, ` +
-          `pricing, sale, discount, course, event signup, or asking for upvotes or purchases? Consider ` +
-          `\`${k}.author\` and \`${k}.account\` (a verified organization is a company or brand account).`,
-        criteria: {
-          true: 'The post sells or promotes something the author or their company offers, such as a product launch, new feature, pricing, discount code, webinar, course, or "try it now" link.',
-          false: "The post is news reporting, a personal update, an opinion, a joke, a technical discussion, research, or a question, and is not trying to get the reader to buy, sign up for, or try the author's offering.",
-        },
-      }),
+      term: 'promotional_marketing',
+      definition: {
+        means: 'The author advertises something they or their company offer: a product, service, launch, feature release, pricing, sale, discount code, course, webinar or event signup, "try it now" link, or a request for upvotes or purchases. A verified organization account is a company or brand.',
+        is_not: "News reporting, a personal update, an opinion, a joke, a technical discussion, research, or a question that is not trying to get the reader to buy, sign up for, or try the author's offering.",
+      },
     },
   };
   const AI_KEYS = Object.keys(FILTERS).filter((k) => FILTERS[k].ai);
+  const DEFINITIONS = Object.fromEntries(AI_KEYS.map((k) => [FILTERS[k].term, FILTERS[k].definition]));
 
   // ---------- settings ----------
   const DEFAULT_FILTERS = { ad: { on: true }, bait: { on: true, threshold: 0.6 }, promo: { on: true, threshold: 0.6 } };
   const savedFilters = GM_getValue('filters', {});
+  // per provider: { url, model, key, headers } — blank url/model fall back to the preset
+  const savedProviders = GM_getValue('providers', {});
   const settings = {
-    apiKey: GM_getValue('apiKey', ''),
+    provider: GM_getValue('provider', 'openrouter'),
+    providers: Object.fromEntries(Object.keys(PROVIDERS).map((p) => [p, { url: '', model: '', key: '', headers: '', ...savedProviders[p] }])),
     mode: GM_getValue('mode', 'collapse'),   // 'collapse' | 'hide'
     showScores: GM_getValue('showScores', false),
     enabled: GM_getValue('enabled', true),
@@ -108,9 +126,33 @@
     GM_deleteValue('threshold');
     GM_deleteValue('cache');
   }
+  // carry over the single OpenRouter key from 2.0
+  if (GM_getValue('apiKey', null) != null) {
+    settings.providers.openrouter.key = GM_getValue('apiKey');
+    GM_setValue('providers', settings.providers);
+    GM_deleteValue('apiKey');
+  }
   let stats = GM_getValue('stats', { posts: 0, cost: 0 });
 
+  function endpoint(name = settings.provider, cfg = settings.providers[name]) {
+    const preset = PROVIDERS[name];
+    let headers = {};
+    try { headers = cfg.headers ? JSON.parse(cfg.headers) : {}; } catch { /* validated in settings */ }
+    return {
+      name,
+      label: preset.label,
+      url: (cfg.url || preset.url).trim(),
+      model: (cfg.model || preset.model).trim(),
+      key: cfg.key.trim(),
+      headers,
+    };
+  }
+
+  // custom endpoints may run without auth; hosted ones need a key
+  const isReady = (ep = endpoint()) => !!ep.url && (ep.name === 'custom' || !!ep.key);
+
   // ---------- cache (author+text hash -> {bait, promo}) ----------
+  GM_deleteValue('cache_v2');
   let cache = GM_getValue(CACHE_KEY, {});
   let cacheDirty = false;
   function saveCacheSoon() {
@@ -187,7 +229,17 @@
     .txf-panel .txf-row small { display: block; color: var(--muted); font-size: 13px; }
     .txf-panel input[type=checkbox] { width: 18px; height: 18px; margin-top: 2px; accent-color: var(--accent); }
     .txf-panel input[type=range] { width: 100%; accent-color: var(--accent); }
-    .txf-panel input[type=password], .txf-panel select {
+    .txf-panel .txf-field { margin-top: 10px; }
+    .txf-panel .txf-field label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 4px; }
+    .txf-panel > small.txf-sub { display: block; margin-top: 6px; }
+    .txf-panel .txf-test { display: flex; gap: 10px; align-items: center; margin-top: 12px; font-size: 13px; color: var(--muted); }
+    .txf-panel .txf-test button {
+      flex: none; border-radius: 999px; padding: 6px 14px; font: 600 13px -apple-system, "Segoe UI", sans-serif;
+      cursor: pointer; background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    }
+    .txf-panel .txf-test button:disabled { opacity: .5; cursor: default; }
+    .txf-panel .txf-test span { min-width: 0; overflow-wrap: anywhere; }
+    .txf-panel input[type=text], .txf-panel input[type=password], .txf-panel select {
       width: 100%; box-sizing: border-box; background: transparent; color: var(--fg);
       border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit;
     }
@@ -203,51 +255,59 @@
     .txf-panel a { color: var(--accent); }
   `);
 
-  // ---------- Jev request ----------
-  function requestJev(posts) {
-    const state = { examples_of_bait: BAIT_EXAMPLES };
-    const questions = {};
-    posts.forEach((p, i) => {
-      state[`post_${i}`] = p;
-      for (const k of AI_KEYS) questions[`p${i}_${k}`] = FILTERS[k].question(`post_${i}`);
-    });
+  // ---------- System One request ----------
+  function callSystemOne(ep, body) {
+    const headers = { 'Content-Type': 'application/json', ...ep.headers };
+    if (ep.key) headers.Authorization = `Bearer ${ep.key}`;
+    if (ep.name === 'openrouter') headers['X-Title'] = APP;
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
         method: 'POST',
-        url: API_URL,
+        url: ep.url,
         timeout: 30000,
-        headers: {
-          Authorization: `Bearer ${settings.apiKey}`,
-          'Content-Type': 'application/json',
-          'X-Title': APP,
-        },
-        data: JSON.stringify({ model: MODEL, state, questions }),
+        headers,
+        data: JSON.stringify({ model: ep.model, ...body }),
         onload: (res) => {
           if (res.status >= 200 && res.status < 300) {
             try {
-              const { answers, usage } = JSON.parse(res.responseText);
-              const scores = posts.map((_, i) => {
-                const s = {};
-                for (const k of AI_KEYS) {
-                  const a = answers[`p${i}_${k}`];
-                  if (!a || typeof a.noul !== 'number') return null;
-                  s[k] = a.noul;
-                }
-                return s;
-              });
-              resolve({ scores, cost: usage?.cost || 0 });
+              resolve(JSON.parse(res.responseText));
             } catch (e) {
-              reject(Object.assign(new Error('Bad response: ' + e.message), { retry: false }));
+              reject(Object.assign(new Error('Response is not JSON: ' + res.responseText.slice(0, 200)), { retry: false }));
             }
           } else {
             const retry = res.status === 429 || res.status >= 500 || res.status === 402;
-            reject(Object.assign(new Error(`Jev ${res.status}: ${res.responseText.slice(0, 300)}`), { retry, status: res.status }));
+            reject(Object.assign(new Error(`${ep.label} ${res.status}: ${(res.responseText || '').slice(0, 300)}`), { retry, status: res.status }));
           }
         },
-        onerror: () => reject(Object.assign(new Error('Network error'), { retry: true })),
-        ontimeout: () => reject(Object.assign(new Error('Timeout'), { retry: true })),
+        onerror: () => reject(Object.assign(new Error(`Could not reach ${ep.url}`), { retry: true })),
+        ontimeout: () => reject(Object.assign(new Error(`Timed out calling ${ep.url}`), { retry: true })),
       });
     });
+  }
+
+  async function requestJev(posts, ep = endpoint()) {
+    const state = { definitions: DEFINITIONS };
+    const questions = {};
+    posts.forEach((p, i) => {
+      state[`post_${i}`] = p;
+      for (const k of AI_KEYS) {
+        questions[`p${i}_${k}`] = { type: 'noul', instructions: `Is \`post_${i}\` \`definitions.${FILTERS[k].term}\`?` };
+      }
+    });
+    const res = await callSystemOne(ep, { state, questions });
+    if (!res || typeof res.answers !== 'object') {
+      throw Object.assign(new Error('Response has no "answers" — is this a System One endpoint?'), { retry: false });
+    }
+    const scores = posts.map((_, i) => {
+      const s = {};
+      for (const k of AI_KEYS) {
+        const a = res.answers[`p${i}_${k}`];
+        if (!a || typeof a.noul !== 'number') return null;
+        s[k] = a.noul;
+      }
+      return s;
+    });
+    return { scores, cost: res.usage?.cost || 0, model: res.model || ep.model };
   }
 
   // ---------- queue ----------
@@ -255,6 +315,7 @@
   let inFlight = 0;
   let flushTimer = null;
   let authFailed = false;
+  let lastErrorToast = 0;
 
   function enqueue(h, post, article) {
     let entry = pending.get(h);
@@ -269,7 +330,7 @@
   }
 
   function flush() {
-    if (authFailed || !settings.apiKey) return;
+    if (authFailed || !isReady()) return;
     while (inFlight < MAX_IN_FLIGHT) {
       const batch = [];
       for (const [h, e] of pending) {
@@ -299,13 +360,17 @@
       console.warn(`[${APP}]`, err.message);
       if (err.status === 401 || err.status === 403) {
         authFailed = true;
-        toast(`${APP}: OpenRouter rejected the API key. Set a new one in Settings (Tampermonkey menu).`);
+        toast(`${APP}: ${endpoint().label} rejected the API key. Fix it in Settings (Tampermonkey menu).`);
       } else if (err.retry && attempt < 3) {
         inFlight--;
         setTimeout(() => sendBatch(batch, attempt + 1), 2000 * 2 ** attempt);
         return;
       } else {
         batch.forEach(([h]) => pending.delete(h));
+        if (Date.now() - lastErrorToast > 60000) {
+          lastErrorToast = Date.now();
+          toast(`${APP}: ${err.message}`);
+        }
       }
     }
     inFlight--;
@@ -503,8 +568,8 @@
     overlay.append(panel);
 
     panel.append(el('h2', '', APP));
-    panel.append(el('p', 'txf-sub',
-      `${stats.posts.toLocaleString()} posts checked so far · $${stats.cost.toFixed(4)} spent on Jev`));
+    panel.append(el('p', 'txf-sub', `${stats.posts.toLocaleString()} posts checked so far` +
+      (stats.cost > 0 ? ` · $${stats.cost.toFixed(4)} spent` : '')));
 
     panel.append(el('h3', '', 'Filters'));
     for (const [k, f] of Object.entries(FILTERS)) {
@@ -548,15 +613,99 @@
     scoreRow.append(scoreCb, scoreBody);
     panel.append(modeRow, scoreRow);
 
-    panel.append(el('h3', '', 'OpenRouter API key'));
-    const key = el('input');
-    Object.assign(key, { type: 'password', value: settings.apiKey, placeholder: 'sk-or-…', autocomplete: 'off' });
+    // ---- AI provider ----
+    panel.append(el('h3', '', 'AI provider'));
+    const draftProviders = JSON.parse(JSON.stringify(settings.providers));
+    let current = settings.provider;
+    const provider = el('select');
+    for (const [p, def] of Object.entries(PROVIDERS)) provider.append(new Option(def.label, p));
+    provider.value = current;
+
+    const field = (labelText, input) => {
+      const wrap = el('div', 'txf-field');
+      wrap.append(el('label', '', labelText), input);
+      panel.append(wrap);
+      return wrap;
+    };
+    const input = (type) => Object.assign(el('input'), { type, autocomplete: 'off', spellcheck: false });
+    const url = input('text');
+    const model = input('text');
+    const key = input('password');
+    const headers = input('text');
+    field('Provider', provider);
+    field('Endpoint URL', url);
+    field('Model', model);
+    field('API key', key);
+    const headersField = field('Extra headers (JSON, optional)', headers);
+    headers.placeholder = '{"X-Api-Key": "…"}';
     const keyHelp = el('small', 'txf-sub');
-    keyHelp.append('Stored in Tampermonkey, only sent to openrouter.ai. Get one at ');
-    const a = el('a', '', 'openrouter.ai/settings/keys');
-    Object.assign(a, { href: 'https://openrouter.ai/settings/keys', target: '_blank', rel: 'noopener' });
-    keyHelp.append(a, '.');
-    panel.append(key, keyHelp);
+    panel.append(keyHelp);
+
+    const loadProvider = (p) => {
+      const def = PROVIDERS[p], cfg = draftProviders[p];
+      url.value = cfg.url;
+      url.placeholder = def.url || 'http://192.168.1.10:8224/v1/systemone';
+      model.value = cfg.model;
+      model.placeholder = def.model;
+      key.value = cfg.key;
+      key.placeholder = def.keyHint;
+      headers.value = cfg.headers;
+      headersField.style.display = p === 'custom' ? '' : 'none';
+      keyHelp.textContent = '';
+      if (def.keyLink) {
+        keyHelp.append('Blank URL/model use the defaults. Get a key at ');
+        const a = Object.assign(el('a', '', def.keyLink.replace(/^https:\/\//, '')), { href: def.keyLink, target: '_blank', rel: 'noopener' });
+        keyHelp.append(a, '.');
+      } else {
+        keyHelp.append('Any server that speaks the System One API (POST { model, state, questions }). Tampermonkey will ask once to allow the host.');
+      }
+    };
+    const storeProvider = (p) => {
+      Object.assign(draftProviders[p], { url: url.value.trim(), model: model.value.trim(), key: key.value.trim(), headers: headers.value.trim() });
+    };
+    provider.addEventListener('change', () => {
+      storeProvider(current);
+      current = provider.value;
+      loadProvider(current);
+      testResult.textContent = '';
+    });
+    loadProvider(current);
+
+    const headersValid = () => {
+      if (!headers.value.trim()) return true;
+      try {
+        const h = JSON.parse(headers.value);
+        return h && typeof h === 'object' && !Array.isArray(h);
+      } catch { return false; }
+    };
+
+    const testRow = el('div', 'txf-test');
+    const testBtn = el('button', '', 'Test connection');
+    testBtn.type = 'button';
+    const testResult = el('span');
+    testRow.append(testBtn, testResult);
+    panel.append(testRow);
+    testBtn.addEventListener('click', async () => {
+      storeProvider(current);
+      if (!headersValid()) { testResult.textContent = '✗ Extra headers must be a JSON object.'; return; }
+      const ep = endpoint(current, draftProviders[current]);
+      if (!isReady(ep)) { testResult.textContent = ep.url ? '✗ Enter an API key first.' : '✗ Enter an endpoint URL first.'; return; }
+      testBtn.disabled = true;
+      testResult.textContent = 'Testing…';
+      const t0 = performance.now();
+      try {
+        const { scores, model: served } = await requestJev([
+          { author: 'Test', account: 'verified', text: 'Name one tool you could never code without.' },
+          { author: 'Test', account: 'unverified', text: 'Had the best ramen of my life in Osaka today.' },
+        ], ep);
+        if (!scores[0] || !scores[1]) throw new Error('Answers are missing noul values.');
+        testResult.textContent = `✓ ${served} · ${Math.round(performance.now() - t0)} ms · ` +
+          `bait sample ${scores[0].bait.toFixed(2)}, normal sample ${scores[1].bait.toFixed(2)}`;
+      } catch (err) {
+        testResult.textContent = `✗ ${err.message}`;
+      }
+      testBtn.disabled = false;
+    });
 
     const actions = el('div', 'txf-actions');
     const clear = el('button', 'txf-left', 'Clear cache');
@@ -574,16 +723,21 @@
     });
     cancel.addEventListener('click', close);
     save.addEventListener('click', () => {
-      const newKey = key.value.trim();
-      if (newKey !== settings.apiKey) {
-        settings.apiKey = newKey;
-        authFailed = false;
-        pending.forEach((e) => { e.sent = false; });
+      storeProvider(current);
+      if (!headersValid()) {
+        testResult.textContent = '✗ Extra headers must be a JSON object.';
+        headers.focus();
+        return;
       }
+      settings.provider = current;
+      settings.providers = draftProviders;
+      authFailed = false;
+      pending.forEach((e) => { e.sent = false; });
       settings.filters = draft;
       settings.mode = mode.value;
       settings.showScores = scoreCb.checked;
-      GM_setValue('apiKey', settings.apiKey);
+      GM_setValue('provider', settings.provider);
+      GM_setValue('providers', settings.providers);
       GM_setValue('filters', settings.filters);
       GM_setValue('mode', settings.mode);
       GM_setValue('showScores', settings.showScores);
@@ -598,7 +752,7 @@
       if (ev.key === 'Escape') close();
     });
     document.body.append(overlay);
-    if (!settings.apiKey) key.focus();
+    if (!isReady()) (url.value || PROVIDERS[current].url ? key : url).focus();
   }
 
   GM_registerMenuCommand('Settings', openSettings);
@@ -610,6 +764,6 @@
   });
 
   // ---------- start ----------
-  if (!settings.apiKey) setTimeout(openSettings, 800);
+  if (!isReady()) setTimeout(openSettings, 800);
   scan();
 })();

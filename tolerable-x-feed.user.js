@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tolerable X Feed
 // @namespace    https://github.com/nikkoxgonzales
-// @version      2.3.1
+// @version      2.3.2
 // @description  Makes your X/Twitter feed tolerable: hides engagement bait, promo posts and paid ads, using TypeSafe's Jev decision model (OpenRouter, TypeSafe, or self-hosted).
 // @author       nikkoxgonzales
 // @homepageURL  https://github.com/nikkoxgonzales/tolerable-x-feed
@@ -200,9 +200,10 @@
     }
     /* State lives in data-* attributes: React rewrites the article's class list on every re-render.
        X lays the article out as a flex row, so the bar gets its own full-width line. */
-    article[data-txf-state] { flex-wrap: wrap !important; }
+    article[data-txf-state], article[data-txf-scored] { flex-wrap: wrap !important; }
     article[data-txf-state] > .txf-bar { flex: 0 0 100%; box-sizing: border-box; min-width: 0; }
-    article[data-txf-state="collapsed"] > :not(.txf-bar):not(.txf-score) { display: none !important; }
+    article[data-txf-state="collapsed"] > :not(.txf-bar) { display: none !important; }
+    article[data-txf-state] > .txf-score { display: none !important; }   /* the bar shows the scores */
     [data-txf-removed] { display: none !important; }
     .txf-bar button {
       margin-left: auto; background: none; border: 1px solid rgba(113,118,123,.5);
@@ -217,14 +218,16 @@
     .txf-bar .txf-check.txf-org { fill: rgb(226,183,25); }
     .txf-bar .txf-handle { overflow: hidden; text-overflow: ellipsis; }
     .txf-bar .txf-sep { flex: none; }
+    .txf-bar .txf-scores { flex: none; margin-left: auto; font: 11px monospace; opacity: .8; }
+    .txf-bar .txf-scores + button { margin-left: 0; }
     article[data-txf-state="open"] { background-color: rgba(255,173,31,.07) !important; }
     .txf-bar.txf-open { color: rgb(255,173,31); }
+    /* in-flow line above the post, so it never covers X's buttons */
     .txf-score {
-      position: absolute; top: 4px; right: 48px; z-index: 2;
-      font: 11px monospace; padding: 1px 5px; border-radius: 4px;
-      background: rgba(113,118,123,.2); color: rgb(113,118,123); pointer-events: none;
+      flex: 0 0 100%; box-sizing: border-box; text-align: right; padding: 4px 16px 0;
+      font: 11px monospace; color: rgb(113,118,123); pointer-events: none;
     }
-    .txf-score.txf-hot { background: rgba(244,33,46,.2); color: rgb(244,33,46); }
+    .txf-score.txf-hot { color: rgb(244,33,46); }
 
     .txf-overlay {
       position: fixed; inset: 0; z-index: 100000; background: rgba(91,112,131,.4);
@@ -462,14 +465,15 @@
   function applyVerdict(article, scores) {
     const hits = hitsFor(scores);
 
+    const scoreText = scores.ad ? 'ad' : AI_KEYS.map((k) => `${k} ${(scores[k] ?? 0).toFixed(2)}`).join(' · ');
     if (settings.showScores) {
       let badge = article.querySelector(':scope > .txf-score');
       if (!badge) {
         badge = el('div', 'txf-score');
-        if (getComputedStyle(article).position === 'static') article.style.position = 'relative';
         article.prepend(badge);
+        article.dataset.txfScored = '1';
       }
-      badge.textContent = scores.ad ? 'ad' : AI_KEYS.map((k) => `${k} ${(scores[k] ?? 0).toFixed(2)}`).join(' · ');
+      badge.textContent = scoreText;
       badge.classList.toggle('txf-hot', hits.length > 0);
     }
     if (!hits.length) return;
@@ -487,7 +491,9 @@
     const label = el('span', 'txf-label');
     const btn = el('button');
     btn.type = 'button';
-    bar.append(label, authorInfo(article), btn);
+    bar.append(label, authorInfo(article));
+    if (settings.showScores) bar.append(el('span', 'txf-scores', scoreText));
+    bar.append(btn);
 
     const setOpen = (open) => {
       article.dataset.txfState = open ? 'open' : 'collapsed';
@@ -539,6 +545,7 @@
     delete article.dataset.txfState;
     article.querySelector(':scope > .txf-bar')?.remove();
     article.querySelector(':scope > .txf-score')?.remove();
+    delete article.dataset.txfScored;
     const cell = article.closest('[data-testid="cellInnerDiv"]');
     if (cell) delete cell.dataset.txfRemoved;
   }

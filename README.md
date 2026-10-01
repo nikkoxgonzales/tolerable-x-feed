@@ -26,6 +26,7 @@ Changed your mind? Click **Show** to open a post. It gets a light amber tint so 
 - **Bring your own backend.** Use OpenRouter, TypeSafe's own API, or any self-hosted server that speaks the System One API.
 - **Shows who posted it.** The collapsed bar shows the author's name, @handle, and a blue or gold verified badge.
 - **Settings panel.** Turn each filter on or off, set its own threshold, choose collapse or remove, test your connection, and see how much you've spent.
+- **Leaves you alone.** Your own posts are never classified or hidden.
 - **Cheap.** Under **1¢ per 1,000 posts** on hosted Jev (see [Efficiency](#efficiency)). Every score is cached, and paid ads never reach the AI.
 
 ## Install
@@ -43,7 +44,7 @@ All three use the same System One request (`POST { model, state, questions }`), 
 
 | Provider | Default endpoint | Default model | Key |
 | --- | --- | --- | --- |
-| **OpenRouter** (default) | `https://openrouter.ai/api/alpha/decisions` | `typesafe/jev-1.13` | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
+| **OpenRouter** (default) | `https://openrouter.ai/api/alpha/decisions` | `~typesafe/jev-latest` (always the newest Jev) | [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) |
 | **TypeSafe** | `https://api.typesafe.ai/v1/systemone` | `jev-latest` | [typesafe.ai](https://typesafe.ai) |
 | **Custom / self-hosted** | anything, e.g. `http://192.168.1.10:8224/v1/systemone` | `jev-1.13` | optional Bearer token |
 

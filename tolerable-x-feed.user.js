@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tolerable X Feed
 // @namespace    https://github.com/nikkoxgonzales
-// @version      2.2.0
+// @version      2.3.0
 // @description  Makes your X/Twitter feed tolerable: hides engagement bait, promo posts and paid ads, using TypeSafe's Jev decision model (OpenRouter, TypeSafe, or self-hosted).
 // @author       nikkoxgonzales
 // @homepageURL  https://github.com/nikkoxgonzales/tolerable-x-feed
@@ -33,7 +33,7 @@
     openrouter: {
       label: 'OpenRouter',
       url: 'https://openrouter.ai/api/alpha/decisions',
-      model: 'typesafe/jev-1.13',
+      model: '~typesafe/jev-latest',
       keyHint: 'sk-or-…',
       keyLink: 'https://openrouter.ai/settings/keys',
     },
@@ -56,7 +56,8 @@
   const MAX_IN_FLIGHT = 2;
   const MAX_CHARS = 1000;
   const MIN_CHARS = 8;
-  const CACHE_KEY = 'cache_v3';  // bump when the question set changes
+  const CACHE_KEY = 'cache_v4';  // bump when the question set or text extraction changes
+  const SAVE_DELAY_MS = 5000;
   const CACHE_MAX = 4000;
 
   // Few-shot examples, taken from twitter-bait-questions.txt
@@ -151,24 +152,35 @@
   // custom endpoints may run without auth; hosted ones need a key
   const isReady = (ep = endpoint()) => !!ep.url && (ep.name === 'custom' || !!ep.key);
 
-  // ---------- cache (author+text hash -> {bait, promo}) ----------
-  GM_deleteValue('cache_v2');
+  // ---------- cache (author+text hash -> [{bait, promo}, timestamp]) ----------
+  for (const old of ['cache_v2', 'cache_v3']) GM_deleteValue(old);
   let cache = GM_getValue(CACHE_KEY, {});
-  let cacheDirty = false;
+  // new results since the last save; merged into storage so several open tabs don't overwrite each other
+  let fresh = {};
+  let statsDelta = { posts: 0, cost: 0 };
+  let saveTimer = null;
   function saveCacheSoon() {
-    if (cacheDirty) return;
-    cacheDirty = true;
-    setTimeout(() => {
-      const keys = Object.keys(cache);
+    if (saveTimer) return;
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      const stored = Object.assign(GM_getValue(CACHE_KEY, {}), fresh);
+      const keys = Object.keys(stored);
       if (keys.length > CACHE_MAX) {
-        keys.sort((a, b) => cache[a][1] - cache[b][1]);
-        for (const k of keys.slice(0, keys.length - CACHE_MAX)) delete cache[k];
+        keys.sort((a, b) => stored[a][1] - stored[b][1]);
+        for (const k of keys.slice(0, keys.length - CACHE_MAX)) delete stored[k];
       }
-      GM_setValue(CACHE_KEY, cache);
+      GM_setValue(CACHE_KEY, stored);
+      cache = stored;
+      fresh = {};
+      const st = GM_getValue('stats', { posts: 0, cost: 0 });
+      stats = { posts: st.posts + statsDelta.posts, cost: st.cost + statsDelta.cost };
       GM_setValue('stats', stats);
-      cacheDirty = false;
-    }, 2000);
+      statsDelta = { posts: 0, cost: 0 };
+    }, SAVE_DELAY_MS);
   }
+
+  const hasAllScores = (sc) => !!sc && AI_KEYS.every((k) => typeof sc[k] === 'number');
+  const anyAiFilterOn = () => AI_KEYS.some((k) => settings.filters[k].on);
 
   function hash(str) {
     let h = 0x811c9dc5;
@@ -184,9 +196,9 @@
     .txf-bar {
       display: flex; align-items: center; gap: 8px;
       padding: 6px 16px; font: 13px/1.4 -apple-system, "Segoe UI", sans-serif;
-      color: rgb(113,118,123); border-bottom: 1px solid rgba(113,118,123,.25);
-      cursor: default;
+      color: rgb(113,118,123); cursor: default;
     }
+    article.txf-collapsed > :not(.txf-bar):not(.txf-score) { display: none !important; }
     .txf-bar button {
       margin-left: auto; background: none; border: 1px solid rgba(113,118,123,.5);
       color: inherit; border-radius: 999px; padding: 2px 10px; cursor: pointer; font: inherit;
@@ -201,7 +213,7 @@
     .txf-bar .txf-handle { overflow: hidden; text-overflow: ellipsis; }
     .txf-bar .txf-sep { flex: none; }
     .txf-bar.txf-open, article.txf-revealed { background-color: rgba(255,173,31,.07) !important; }
-    .txf-bar.txf-open { border-bottom: none; color: rgb(255,173,31); }
+    .txf-bar.txf-open { color: rgb(255,173,31); }
     .txf-score {
       position: absolute; top: 4px; right: 48px; z-index: 2;
       font: 11px monospace; padding: 1px 5px; border-radius: 4px;
@@ -276,7 +288,9 @@
             }
           } else {
             const retry = res.status === 429 || res.status >= 500 || res.status === 402;
-            reject(Object.assign(new Error(`${ep.label} ${res.status}: ${(res.responseText || '').slice(0, 300)}`), { retry, status: res.status }));
+            const after = /^retry-after:\s*(\d+)/im.exec(res.responseHeaders || '');
+            reject(Object.assign(new Error(`${ep.label} ${res.status}: ${(res.responseText || '').slice(0, 300)}`),
+              { retry, status: res.status, retryAfterMs: after ? +after[1] * 1000 : 0 }));
           }
         },
         onerror: () => reject(Object.assign(new Error(`Could not reach ${ep.url}`), { retry: true })),
@@ -303,7 +317,7 @@
       for (const k of AI_KEYS) {
         const a = res.answers[`p${i}_${k}`];
         if (!a || typeof a.noul !== 'number') return null;
-        s[k] = a.noul;
+        s[k] = Math.round(a.noul * 1000) / 1000;
       }
       return s;
     });
@@ -348,22 +362,24 @@
     inFlight++;
     try {
       const { scores, cost } = await requestJev(batch.map(([, e]) => e.post));
-      stats = { posts: stats.posts + batch.length, cost: stats.cost + cost };
+      statsDelta.posts += batch.length;
+      statsDelta.cost += cost;
       batch.forEach(([h, e], i) => {
         pending.delete(h);
         if (!scores[i]) return;
-        cache[h] = [scores[i], Date.now()];
-        for (const a of e.articles) if (a.isConnected && a.dataset.txfHash === h) applyVerdict(a, scores[i]);
+        cache[h] = fresh[h] = [scores[i], Date.now()];
+        for (const a of e.articles) if (a.isConnected && a.dataset.txfId === h) applyVerdict(a, scores[i]);
       });
       saveCacheSoon();
     } catch (err) {
       console.warn(`[${APP}]`, err.message);
       if (err.status === 401 || err.status === 403) {
+        if (!authFailed) toast(`${APP}: ${endpoint().label} rejected the API key. Fix it in Settings (Tampermonkey menu).`);
         authFailed = true;
-        toast(`${APP}: ${endpoint().label} rejected the API key. Fix it in Settings (Tampermonkey menu).`);
+        batch.forEach(([, e]) => { e.sent = false; });   // re-sent once the key is fixed
       } else if (err.retry && attempt < 3) {
         inFlight--;
-        setTimeout(() => sendBatch(batch, attempt + 1), 2000 * 2 ** attempt);
+        setTimeout(() => sendBatch(batch, attempt + 1), err.retryAfterMs || 2000 * 2 ** attempt);
         return;
       } else {
         batch.forEach(([h]) => pending.delete(h));
@@ -378,9 +394,30 @@
   }
 
   // ---------- reading posts ----------
+  // walks the DOM instead of using innerText, which forces a layout on every call;
+  // X draws emoji as <img alt="🚀">, so those are kept too
   function getText(article) {
-    const n = article.querySelector('[data-testid="tweetText"]');
-    return n ? n.innerText.trim().slice(0, MAX_CHARS) : '';
+    const root = article.querySelector('[data-testid="tweetText"]');
+    if (!root) return '';
+    let out = '';
+    (function walk(node) {
+      for (const c of node.childNodes) {
+        if (c.nodeType === 3) out += c.nodeValue;
+        else if (c.nodeName === 'IMG') out += c.alt || '';
+        else if (c.nodeName === 'BR') out += '\n';
+        else if (c.nodeType === 1) walk(c);
+      }
+    })(root);
+    return out.trim().slice(0, MAX_CHARS);
+  }
+
+  let ownHandle = null;
+  function getOwnHandle() {
+    if (!ownHandle) {
+      const href = document.querySelector('a[data-testid="AppTabBar_Profile_Link"]')?.getAttribute('href');
+      if (href) ownHandle = '@' + href.replace(/^\//, '').toLowerCase();
+    }
+    return ownHandle;
   }
 
   function getAuthor(article) {
@@ -427,7 +464,7 @@
         if (getComputedStyle(article).position === 'static') article.style.position = 'relative';
         article.prepend(badge);
       }
-      badge.textContent = scores.ad ? 'ad' : AI_KEYS.map((k) => `${k} ${scores[k].toFixed(2)}`).join(' · ');
+      badge.textContent = scores.ad ? 'ad' : AI_KEYS.map((k) => `${k} ${(scores[k] ?? 0).toFixed(2)}`).join(' · ');
       badge.classList.toggle('txf-hot', hits.length > 0);
     }
     if (!hits.length) return;
@@ -438,8 +475,9 @@
       cell.dataset.txfHidden = '1';
       return;
     }
-    if (article.previousElementSibling?.classList.contains('txf-bar')) return;
+    if (article.querySelector(':scope > .txf-bar')) return;
 
+    // The bar lives inside the article, so it goes away with it when X re-renders or recycles the node
     const what = hits.map((k) => hitText(k, scores)).join(' + ');
     const bar = el('div', 'txf-bar');
     const label = el('span', 'txf-label');
@@ -448,21 +486,22 @@
     bar.append(label, authorInfo(article), btn);
 
     const setOpen = (open) => {
-      article.style.display = open ? '' : 'none';
+      article.classList.toggle('txf-collapsed', !open);
       article.classList.toggle('txf-revealed', open);
       bar.classList.toggle('txf-open', open);
       label.textContent = open ? what : `${what} hidden`;
       btn.textContent = open ? 'Hide' : 'Show';
-      if (open) article.dataset.txfRevealed = '1';
-      else delete article.dataset.txfRevealed;
     };
-    btn.addEventListener('click', (ev) => {
-      ev.preventDefault();
+    // keep clicks on the bar from opening the post
+    bar.addEventListener('click', (ev) => {
       ev.stopPropagation();
-      setOpen(!article.dataset.txfRevealed);
+      if (ev.target === btn) {
+        ev.preventDefault();
+        setOpen(article.classList.contains('txf-collapsed'));
+      }
     });
-    article.before(bar);
-    setOpen(!!article.dataset.txfRevealed);
+    article.prepend(bar);
+    setOpen(false);
   }
 
   function el(tag, cls, text) {
@@ -494,10 +533,8 @@
   }
 
   function resetArticle(article) {
-    article.style.display = '';
-    article.classList.remove('txf-revealed');
-    delete article.dataset.txfRevealed;
-    if (article.previousElementSibling?.classList.contains('txf-bar')) article.previousElementSibling.remove();
+    article.classList.remove('txf-collapsed', 'txf-revealed');
+    article.querySelector(':scope > .txf-bar')?.remove();
     article.querySelector(':scope > .txf-score')?.remove();
     const cell = article.closest('[data-testid="cellInnerDiv"]');
     if (cell?.dataset.txfHidden) { cell.style.display = ''; delete cell.dataset.txfHidden; }
@@ -505,23 +542,28 @@
 
   function processArticle(article) {
     if (!settings.enabled) return;
-    const ad = isPaidAd(article);
     const text = getText(article);
     const author = getAuthor(article);
-    const id = hash(`${author.name}\n${author.account}\n${text}`);
-    const key = ad ? `ad:${id}` : text.length >= MIN_CHARS ? id : '';
-    // X recycles DOM nodes while scrolling, so re-check when the content changes
-    if (article.dataset.txfHash === key) return;
-    if (article.dataset.txfHash !== undefined) resetArticle(article);
-    article.dataset.txfHash = key;
-    if (!key) return;
+    const ad = isPaidAd(article);
+    const id = hash(`${author.name}\n${author.account}\n${text}`) + (ad ? ':ad' : '');
+    // X recycles DOM nodes while scrolling, so only re-check when the content changes
+    if (article.dataset.txfId === id) return;
+    if (article.dataset.txfId !== undefined) resetArticle(article);
+    article.dataset.txfId = id;
+
+    if (author.handle && author.handle.toLowerCase() === getOwnHandle()) return;   // never your own posts
     if (ad) return applyVerdict(article, { ad: 1 });
-    const hit = cache[key];
-    if (hit) applyVerdict(article, hit[0]);
-    else enqueue(key, { author: author.name, account: author.account, text }, article);
+    if (text.length < MIN_CHARS || !anyAiFilterOn()) return;
+    const hit = cache[id];
+    if (hit && hasAllScores(hit[0])) applyVerdict(article, hit[0]);
+    else enqueue(id, { author: author.name, account: author.account, text }, article);
   }
 
-  function syncTheme() {
+  let themeCheckedAt = 0;
+  function syncTheme(force) {
+    const now = Date.now();
+    if (!force && now - themeCheckedAt < 1000) return;
+    themeCheckedAt = now;
     const m = getComputedStyle(document.body).backgroundColor.match(/\d+/g);
     const light = m ? (+m[0] + +m[1] + +m[2]) / 3 > 128 : false;
     document.documentElement.classList.toggle('txf-light', light);
@@ -542,7 +584,7 @@
   function rescanAll() {
     document.querySelectorAll('article[data-testid="tweet"]').forEach((a) => {
       resetArticle(a);
-      delete a.dataset.txfHash;
+      delete a.dataset.txfId;
     });
     scan();
   }
@@ -561,15 +603,16 @@
 
   function openSettings() {
     if (document.querySelector('.txf-overlay')) return;
-    syncTheme();
+    syncTheme(true);
     const draft = JSON.parse(JSON.stringify(settings.filters));
     const overlay = el('div', 'txf-overlay');
     const panel = el('div', 'txf-panel');
     overlay.append(panel);
 
     panel.append(el('h2', '', APP));
-    panel.append(el('p', 'txf-sub', `${stats.posts.toLocaleString()} posts checked so far` +
-      (stats.cost > 0 ? ` · $${stats.cost.toFixed(4)} spent` : '')));
+    const checked = stats.posts + statsDelta.posts, spent = stats.cost + statsDelta.cost;
+    panel.append(el('p', 'txf-sub', `${checked.toLocaleString()} posts checked so far` +
+      (spent > 0 ? ` · $${spent.toFixed(4)} spent` : '')));
 
     panel.append(el('h3', '', 'Filters'));
     for (const [k, f] of Object.entries(FILTERS)) {
@@ -717,6 +760,7 @@
     const close = () => overlay.remove();
     clear.addEventListener('click', () => {
       cache = {};
+      fresh = {};
       GM_setValue(CACHE_KEY, cache);
       clear.textContent = 'Cache cleared';
       clear.disabled = true;
@@ -732,7 +776,6 @@
       settings.provider = current;
       settings.providers = draftProviders;
       authFailed = false;
-      pending.forEach((e) => { e.sent = false; });
       settings.filters = draft;
       settings.mode = mode.value;
       settings.showScores = scoreCb.checked;
@@ -745,7 +788,10 @@
       rescanAll();
       flush();
     });
-    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) close(); });
+    // close on a backdrop click, but not when a text-selection drag ends outside the panel
+    let downOnBackdrop = false;
+    overlay.addEventListener('mousedown', (ev) => { downOnBackdrop = ev.target === overlay; });
+    overlay.addEventListener('click', (ev) => { if (ev.target === overlay && downOnBackdrop) close(); });
     // keep X's keyboard shortcuts (j, k, l, n...) from firing while typing in the panel
     overlay.addEventListener('keydown', (ev) => {
       ev.stopPropagation();

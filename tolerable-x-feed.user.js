@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tolerable X Feed
 // @namespace    https://github.com/nikkoxgonzales
-// @version      2.3.0
+// @version      2.3.1
 // @description  Makes your X/Twitter feed tolerable: hides engagement bait, promo posts and paid ads, using TypeSafe's Jev decision model (OpenRouter, TypeSafe, or self-hosted).
 // @author       nikkoxgonzales
 // @homepageURL  https://github.com/nikkoxgonzales/tolerable-x-feed
@@ -198,7 +198,12 @@
       padding: 6px 16px; font: 13px/1.4 -apple-system, "Segoe UI", sans-serif;
       color: rgb(113,118,123); cursor: default;
     }
-    article.txf-collapsed > :not(.txf-bar):not(.txf-score) { display: none !important; }
+    /* State lives in data-* attributes: React rewrites the article's class list on every re-render.
+       X lays the article out as a flex row, so the bar gets its own full-width line. */
+    article[data-txf-state] { flex-wrap: wrap !important; }
+    article[data-txf-state] > .txf-bar { flex: 0 0 100%; box-sizing: border-box; min-width: 0; }
+    article[data-txf-state="collapsed"] > :not(.txf-bar):not(.txf-score) { display: none !important; }
+    [data-txf-removed] { display: none !important; }
     .txf-bar button {
       margin-left: auto; background: none; border: 1px solid rgba(113,118,123,.5);
       color: inherit; border-radius: 999px; padding: 2px 10px; cursor: pointer; font: inherit;
@@ -212,7 +217,7 @@
     .txf-bar .txf-check.txf-org { fill: rgb(226,183,25); }
     .txf-bar .txf-handle { overflow: hidden; text-overflow: ellipsis; }
     .txf-bar .txf-sep { flex: none; }
-    .txf-bar.txf-open, article.txf-revealed { background-color: rgba(255,173,31,.07) !important; }
+    article[data-txf-state="open"] { background-color: rgba(255,173,31,.07) !important; }
     .txf-bar.txf-open { color: rgb(255,173,31); }
     .txf-score {
       position: absolute; top: 4px; right: 48px; z-index: 2;
@@ -471,8 +476,7 @@
 
     const cell = article.closest('[data-testid="cellInnerDiv"]') || article.parentElement;
     if (settings.mode === 'hide') {
-      cell.style.display = 'none';
-      cell.dataset.txfHidden = '1';
+      cell.dataset.txfRemoved = '1';
       return;
     }
     if (article.querySelector(':scope > .txf-bar')) return;
@@ -486,8 +490,7 @@
     bar.append(label, authorInfo(article), btn);
 
     const setOpen = (open) => {
-      article.classList.toggle('txf-collapsed', !open);
-      article.classList.toggle('txf-revealed', open);
+      article.dataset.txfState = open ? 'open' : 'collapsed';
       bar.classList.toggle('txf-open', open);
       label.textContent = open ? what : `${what} hidden`;
       btn.textContent = open ? 'Hide' : 'Show';
@@ -497,7 +500,7 @@
       ev.stopPropagation();
       if (ev.target === btn) {
         ev.preventDefault();
-        setOpen(article.classList.contains('txf-collapsed'));
+        setOpen(article.dataset.txfState === 'collapsed');
       }
     });
     article.prepend(bar);
@@ -533,11 +536,11 @@
   }
 
   function resetArticle(article) {
-    article.classList.remove('txf-collapsed', 'txf-revealed');
+    delete article.dataset.txfState;
     article.querySelector(':scope > .txf-bar')?.remove();
     article.querySelector(':scope > .txf-score')?.remove();
     const cell = article.closest('[data-testid="cellInnerDiv"]');
-    if (cell?.dataset.txfHidden) { cell.style.display = ''; delete cell.dataset.txfHidden; }
+    if (cell) delete cell.dataset.txfRemoved;
   }
 
   function processArticle(article) {

@@ -1,0 +1,71 @@
+Would you hire a developer who only knows vibe coding?
+You wake up in 1999 with a laptop, Wi-Fi, and a coding agent. What do you ship first?
+if software engineering is completely solved by ai what is the next hard challenge to solve
+Name one company that has completely lost its vibe
+Show me one engineer who writes better code than an llm.
+AI makes everyone 10x faster. Why isn't everyone 10x more successful?
+Tell me one thing you can do that CLAUDE cannot do yet
+If AI writes 90% of the code, what exactly makes someone a developer?
+You wake up tomorrow and GitHub is gone. What’s the first thing that becomes a problem?
+What’s the best way to get customers in the beginning: sales, ads, content? Something else?
+Yep. Same “tech Twitter bait but actually interesting” vibe:
+
+- Would you hire a developer who can build anything with AI but struggles to code from scratch?
+- If coding becomes free, what becomes expensive?
+- What skill becomes more valuable as AI gets better at programming?
+- If everyone has access to the same AI models, where does competitive advantage come from?
+- What happens to junior developers when AI becomes the junior developer?
+- At what point does “vibe coding” just become “coding”?
+- If an AI agent can build your entire MVP overnight, what are you doing the next morning?
+- What’s one programming skill AI will probably never make irrelevant?
+- If you removed AI from developers tomorrow, how many would suddenly feel 5x slower?
+- Does knowing how to code still matter if you can reliably describe what you want?
+- What’s harder: writing good code or knowing what code should exist?
+- If AI can clone any SaaS in a weekend, what actually makes a startup defensible?
+- What will developers complain about when coding itself is no longer the bottleneck?
+- Would you rather hire a great engineer with average AI skills or an average engineer who is incredible with agents?
+- What’s the first developer job title that disappears because of AI?
+- What’s the last developer job title that disappears because of AI?
+- If Claude can write better code than you, does that make you a worse engineer?
+- If everyone can build software, who wins?
+- What’s something developers spend hours doing today that will look ridiculous in five years?
+- If AI removes 80% of engineering work, does software get cheaper or do companies just build 5x more software?
+- What happens when the bottleneck is no longer engineering but deciding what to build?
+- Is prompt engineering actually disappearing, or just becoming normal computer usage?
+- Would you trust an AI-generated codebase you’ve never personally read?
+- If one developer with agents can do the work of ten, do companies hire fewer people or build ten times more?
+- What’s more dangerous: developers trusting AI too much or refusing to use it?
+- If you started learning programming today, what would you completely skip?
+- What would you learn today that most developers still underestimate?
+- What’s the strongest argument against vibe coding?
+- What’s the strongest argument for vibe coding?
+- When AI can debug its own code, what does debugging become?
+- If software becomes almost free to create, what industry gets disrupted next?
+- What’s one thing current coding agents are still embarrassingly bad at?
+- How much of being a “senior engineer” is actually coding?
+- If AI can read an entire codebase instantly, does documentation become more or less important?
+- Will GitHub eventually become more valuable for training agents than for humans reading code?
+- If you could give a 2015 developer one modern AI tool, which one would feel the most like magic?
+- What’s the new “learn to code” in an AI-first world?
+- Would you rather own the best model or the best proprietary data?
+- If execution becomes cheap, are ideas finally valuable again?
+- Name one startup that could not have existed before AI agents.
+- What is currently being called “AI” that will just be considered normal software in three years?
+- If every employee gets an AI agent, what happens to middle management?
+- What’s one job people think AI will replace that will probably survive much longer than expected?
+- What’s one job people think is safe that probably isn’t?
+- If AI can build your product, market it, and sell it, what exactly is the founder’s job?
+- What would you build if engineering cost literally $0?
+- You get unlimited access to the best coding agent for 24 hours. What do you make?
+- You wake up in 2005 with GPT-5-level AI. How quickly do you become a billionaire?
+- You can bring one modern technology back to 1995. What do you choose?
+- Delete one from existence: Stack Overflow, GitHub, VS Code, or Docker.
+- What’s the most overrated skill in software engineering right now?
+- What’s the most underrated skill in software engineering right now?
+- Name a technology everyone loves that you think will be irrelevant in 10 years.
+- What’s a software engineering opinion that would get you ratioed but you still believe?
+- What’s the biggest lie developers tell themselves about AI?
+- When was the last time you wrote code without asking an AI anything?
+- Be honest: are you using AI to code faster, or using AI because you forgot how to code?
+- What percentage of your current codebase could you rebuild from scratch without Google or AI?
+- If your favorite AI coding tool disappeared tomorrow, how cooked are you?

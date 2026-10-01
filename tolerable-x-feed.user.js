@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tolerable X Feed
 // @namespace    https://github.com/nikkoxgonzales
-// @version      2.3.2
+// @version      2.5.0
 // @description  Makes your X/Twitter feed tolerable: hides engagement bait, promo posts and paid ads, using TypeSafe's Jev decision model (OpenRouter, TypeSafe, or self-hosted).
 // @author       nikkoxgonzales
 // @homepageURL  https://github.com/nikkoxgonzales/tolerable-x-feed
@@ -51,7 +51,7 @@
       keyHint: 'Bearer token (optional)',
     },
   };
-  const BATCH_SIZE = 16;         // posts per request; tested up to 16 with no accuracy loss
+  const BATCH_SIZE = 32;         // max posts per request; tested up to 32 with no accuracy loss
   const FLUSH_DELAY_MS = 350;    // wait this long to fill a batch while scrolling
   const MAX_IN_FLIGHT = 2;
   const MAX_CHARS = 1000;
@@ -59,6 +59,8 @@
   const CACHE_KEY = 'cache_v4';  // bump when the question set or text extraction changes
   const SAVE_DELAY_MS = 5000;
   const CACHE_MAX = 4000;
+  const PENDING_MAX = 300;       // posts waiting to be classified; oldest dropped beyond this
+  const COOLDOWN_MS = 60000;     // pause after a batch fails all retries, then try again
 
   // Few-shot examples, taken from twitter-bait-questions.txt
   const BAIT_EXAMPLES = [
@@ -73,9 +75,9 @@
   ];
 
   // Each AI filter is one Jev "noul" (yes/no probability) question per post. The definition is sent
-  // once per request in state.definitions and every question just points at it: 3x fewer tokens than
-  // repeating it in each question, with the same accuracy (see README "Efficiency").
-  // All filters are asked for every post so cached scores stay complete when you toggle filters.
+  // once per request in state.definitions and every question just points at it, and each post is one
+  // compact string: 4x fewer tokens than the first version, same accuracy (see README "Efficiency").
+  // Only enabled filters are asked; turning one on later asks just that question for cached posts.
   const FILTERS = {
     ad: {
       label: 'Ad',
@@ -105,7 +107,6 @@
     },
   };
   const AI_KEYS = Object.keys(FILTERS).filter((k) => FILTERS[k].ai);
-  const DEFINITIONS = Object.fromEntries(AI_KEYS.map((k) => [FILTERS[k].term, FILTERS[k].definition]));
 
   // ---------- settings ----------
   const DEFAULT_FILTERS = { ad: { on: true }, bait: { on: true, threshold: 0.6 }, promo: { on: true, threshold: 0.6 } };
@@ -163,7 +164,8 @@
     if (saveTimer) return;
     saveTimer = setTimeout(() => {
       saveTimer = null;
-      const stored = Object.assign(GM_getValue(CACHE_KEY, {}), fresh);
+      const stored = GM_getValue(CACHE_KEY, {});
+      for (const [h, [sc, t]] of Object.entries(fresh)) stored[h] = [{ ...stored[h]?.[0], ...sc }, t];
       const keys = Object.keys(stored);
       if (keys.length > CACHE_MAX) {
         keys.sort((a, b) => stored[a][1] - stored[b][1]);
@@ -179,8 +181,8 @@
     }, SAVE_DELAY_MS);
   }
 
-  const hasAllScores = (sc) => !!sc && AI_KEYS.every((k) => typeof sc[k] === 'number');
-  const anyAiFilterOn = () => AI_KEYS.some((k) => settings.filters[k].on);
+  const enabledAiKeys = () => AI_KEYS.filter((k) => settings.filters[k].on);
+  const missingScores = (sc) => enabledAiKeys().filter((k) => typeof sc?.[k] !== 'number');
 
   function hash(str) {
     let h = 0x811c9dc5;
@@ -240,6 +242,7 @@
       font: 15px/1.4 -apple-system, "Segoe UI", sans-serif; box-shadow: 0 0 15px rgba(255,255,255,.2);
     }
     .txf-light .txf-panel { --bg: #fff; --fg: rgb(15,20,25); --muted: rgb(83,100,113); --line: rgb(239,243,244); box-shadow: 0 0 15px rgba(0,0,0,.2); }
+    .txf-panel:focus { outline: none; }
     .txf-panel h2 { margin: 0 0 4px; font-size: 20px; }
     .txf-panel h3 { margin: 18px 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
     .txf-panel .txf-sub { color: var(--muted); font-size: 13px; margin: 0; }
@@ -307,12 +310,18 @@
     });
   }
 
-  async function requestJev(posts, ep = endpoint()) {
-    const state = { definitions: DEFINITIONS };
+  // "Acme [verified organization]: text" — one string per post is ~15% fewer tokens than a JSON object
+  // with named fields and scores the same. Posts must keep their own state keys: putting them in an
+  // array and asking about `posts[3]` was cheaper but mixed posts up.
+  const compactPost = (p) =>
+    (p.author ? `${p.author}${p.account === 'unverified' ? '' : ` [${p.account}]`}: ` : '') + p.text;
+
+  async function requestJev(posts, ep = endpoint(), keys = enabledAiKeys()) {
+    const state = { definitions: Object.fromEntries(keys.map((k) => [FILTERS[k].term, FILTERS[k].definition])) };
     const questions = {};
     posts.forEach((p, i) => {
-      state[`post_${i}`] = p;
-      for (const k of AI_KEYS) {
+      state[`post_${i}`] = compactPost(p);
+      for (const k of keys) {
         questions[`p${i}_${k}`] = { type: 'noul', instructions: `Is \`post_${i}\` \`definitions.${FILTERS[k].term}\`?` };
       }
     });
@@ -322,7 +331,7 @@
     }
     const scores = posts.map((_, i) => {
       const s = {};
-      for (const k of AI_KEYS) {
+      for (const k of keys) {
         const a = res.answers[`p${i}_${k}`];
         if (!a || typeof a.noul !== 'number') return null;
         s[k] = Math.round(a.noul * 1000) / 1000;
@@ -338,26 +347,49 @@
   let flushTimer = null;
   let authFailed = false;
   let lastErrorToast = 0;
+  let cooldownUntil = 0;
+  let unsent = 0;
 
   function enqueue(h, post, article) {
     let entry = pending.get(h);
-    if (!entry) pending.set(h, (entry = { post, articles: new Set(), sent: false }));
+    if (!entry) {
+      pending.set(h, (entry = { post, articles: new Set(), sent: false }));
+      unsent++;
+      // scrolled far past while the endpoint is down: forget the oldest waiting posts
+      if (pending.size > PENDING_MAX) {
+        for (const [oh, oe] of pending) {
+          if (oe.sent) continue;
+          pending.delete(oh);
+          unsent--;
+          break;
+        }
+      }
+    }
     entry.articles.add(article);
-    scheduleFlush();
+    if (unsent >= BATCH_SIZE) flush();   // a full batch is waiting, no need to wait for more
+    else scheduleFlush();
   }
 
-  function scheduleFlush() {
+  function scheduleFlush(delay = FLUSH_DELAY_MS) {
     if (flushTimer) return;
-    flushTimer = setTimeout(() => { flushTimer = null; flush(); }, FLUSH_DELAY_MS);
+    flushTimer = setTimeout(() => { flushTimer = null; flush(); }, delay);
+  }
+
+  function markUnsent(batch) {
+    for (const [h, e] of batch) {
+      if (pending.get(h) === e && e.sent) { e.sent = false; unsent++; }
+    }
   }
 
   function flush() {
     if (authFailed || !isReady()) return;
+    if (Date.now() < cooldownUntil) return scheduleFlush(cooldownUntil - Date.now());
     while (inFlight < MAX_IN_FLIGHT) {
       const batch = [];
       for (const [h, e] of pending) {
         if (e.sent) continue;
         e.sent = true;
+        unsent--;
         batch.push([h, e]);
         if (batch.length >= BATCH_SIZE) break;
       }
@@ -369,14 +401,18 @@
   async function sendBatch(batch, attempt) {
     inFlight++;
     try {
-      const { scores, cost } = await requestJev(batch.map(([, e]) => e.post));
+      // only the questions some post in the batch still lacks (e.g. a filter was just turned on)
+      const keys = enabledAiKeys().filter((k) => batch.some(([h]) => typeof cache[h]?.[0]?.[k] !== 'number'));
+      if (!keys.length) { batch.forEach(([h]) => pending.delete(h)); inFlight--; return; }
+      const { scores, cost } = await requestJev(batch.map(([, e]) => e.post), endpoint(), keys);
       statsDelta.posts += batch.length;
       statsDelta.cost += cost;
       batch.forEach(([h, e], i) => {
         pending.delete(h);
         if (!scores[i]) return;
-        cache[h] = fresh[h] = [scores[i], Date.now()];
-        for (const a of e.articles) if (a.isConnected && a.dataset.txfId === h) applyVerdict(a, scores[i]);
+        const merged = { ...cache[h]?.[0], ...scores[i] };
+        cache[h] = fresh[h] = [merged, Date.now()];
+        for (const a of e.articles) if (a.isConnected && a.dataset.txfId === h) applyVerdict(a, merged);
       });
       saveCacheSoon();
     } catch (err) {
@@ -384,13 +420,15 @@
       if (err.status === 401 || err.status === 403) {
         if (!authFailed) toast(`${APP}: ${endpoint().label} rejected the API key. Fix it in Settings (Tampermonkey menu).`);
         authFailed = true;
-        batch.forEach(([, e]) => { e.sent = false; });   // re-sent once the key is fixed
+        markUnsent(batch);   // re-sent once the key is fixed
       } else if (err.retry && attempt < 3) {
         inFlight--;
         setTimeout(() => sendBatch(batch, attempt + 1), err.retryAfterMs || 2000 * 2 ** attempt);
         return;
       } else {
-        batch.forEach(([h]) => pending.delete(h));
+        // endpoint is down or misconfigured: keep the posts and try again after a cooldown
+        cooldownUntil = Date.now() + COOLDOWN_MS;
+        markUnsent(batch);
         if (Date.now() - lastErrorToast > 60000) {
           lastErrorToast = Date.now();
           toast(`${APP}: ${err.message}`);
@@ -407,6 +445,10 @@
   function getText(article) {
     const root = article.querySelector('[data-testid="tweetText"]');
     if (!root) return '';
+    // A post that only quotes another has no text of its own; the first text then belongs to the
+    // quoted post, which sits after the second author header
+    const quotedAuthor = article.querySelectorAll('[data-testid="User-Name"]')[1];
+    if (quotedAuthor && quotedAuthor.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING) return '';
     let out = '';
     (function walk(node) {
       for (const c of node.childNodes) {
@@ -447,7 +489,7 @@
     for (const s of article.querySelectorAll('span')) {
       if (s.childElementCount) continue;
       const t = s.textContent.trim();
-      if ((t === 'Ad' || t === 'Promoted') && !s.closest('[data-testid="tweetText"], [data-testid="User-Name"]')) return true;
+      if ((t === 'Ad' || t === 'Promoted') && !s.closest('[data-testid="tweetText"], [data-testid="User-Name"], .txf-bar, .txf-score')) return true;
     }
     return false;
   }
@@ -465,7 +507,8 @@
   function applyVerdict(article, scores) {
     const hits = hitsFor(scores);
 
-    const scoreText = scores.ad ? 'ad' : AI_KEYS.map((k) => `${k} ${(scores[k] ?? 0).toFixed(2)}`).join(' · ');
+    const scoreText = scores.ad ? 'ad'
+      : AI_KEYS.filter((k) => typeof scores[k] === 'number').map((k) => `${k} ${scores[k].toFixed(2)}`).join(' · ');
     if (settings.showScores) {
       let badge = article.querySelector(':scope > .txf-score');
       if (!badge) {
@@ -558,15 +601,16 @@
     const id = hash(`${author.name}\n${author.account}\n${text}`) + (ad ? ':ad' : '');
     // X recycles DOM nodes while scrolling, so only re-check when the content changes
     if (article.dataset.txfId === id) return;
-    if (article.dataset.txfId !== undefined) resetArticle(article);
+    resetArticle(article);   // also un-hides a cell X reused for a new post in "remove" mode
     article.dataset.txfId = id;
 
     if (author.handle && author.handle.toLowerCase() === getOwnHandle()) return;   // never your own posts
     if (ad) return applyVerdict(article, { ad: 1 });
-    if (text.length < MIN_CHARS || !anyAiFilterOn()) return;
+    if (text.length < MIN_CHARS || !enabledAiKeys().length) return;
     const hit = cache[id];
-    if (hit && hasAllScores(hit[0])) applyVerdict(article, hit[0]);
-    else enqueue(id, { author: author.name, account: author.account, text }, article);
+    if (hit && !missingScores(hit[0]).length) applyVerdict(article, hit[0]);
+    else if (isReady()) enqueue(id, { author: author.name, account: author.account, text }, article);
+    // without an endpoint the post is picked up by the rescan after settings are saved
   }
 
   let themeCheckedAt = 0;
@@ -595,6 +639,15 @@
     document.querySelectorAll('article[data-testid="tweet"]').forEach((a) => {
       resetArticle(a);
       delete a.dataset.txfId;
+    });
+    scan();
+  }
+
+  // re-check only posts without a verdict, so posts you opened stay open
+  function rescanUnclassified() {
+    document.querySelectorAll('article[data-testid="tweet"]').forEach((a) => {
+      const cell = a.closest('[data-testid="cellInnerDiv"]');
+      if (!a.dataset.txfState && !cell?.dataset.txfRemoved && !a.querySelector(':scope > .txf-score')) delete a.dataset.txfId;
     });
     scan();
   }
@@ -750,7 +803,7 @@
         const { scores, model: served } = await requestJev([
           { author: 'Test', account: 'verified', text: 'Name one tool you could never code without.' },
           { author: 'Test', account: 'unverified', text: 'Had the best ramen of my life in Osaka today.' },
-        ], ep);
+        ], ep, ['bait']);
         if (!scores[0] || !scores[1]) throw new Error('Answers are missing noul values.');
         testResult.textContent = `✓ ${served} · ${Math.round(performance.now() - t0)} ms · ` +
           `bait sample ${scores[0].bait.toFixed(2)}, normal sample ${scores[1].bait.toFixed(2)}`;
@@ -783,9 +836,12 @@
         headers.focus();
         return;
       }
+      const displayKey = () => JSON.stringify([settings.filters, settings.mode, settings.showScores]);
+      const before = displayKey();
       settings.provider = current;
       settings.providers = draftProviders;
       authFailed = false;
+      cooldownUntil = 0;
       settings.filters = draft;
       settings.mode = mode.value;
       settings.showScores = scoreCb.checked;
@@ -795,7 +851,8 @@
       GM_setValue('mode', settings.mode);
       GM_setValue('showScores', settings.showScores);
       close();
-      rescanAll();
+      if (displayKey() !== before) rescanAll();
+      else rescanUnclassified();
       flush();
     });
     // close on a backdrop click, but not when a text-selection drag ends outside the panel
@@ -808,7 +865,9 @@
       if (ev.key === 'Escape') close();
     });
     document.body.append(overlay);
+    panel.tabIndex = -1;
     if (!isReady()) (url.value || PROVIDERS[current].url ? key : url).focus();
+    else panel.focus();
   }
 
   GM_registerMenuCommand('Settings', openSettings);

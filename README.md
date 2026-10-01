@@ -27,7 +27,7 @@ Changed your mind? Click **Show** to open a post. It gets a light amber tint so 
 - **Shows who posted it.** The collapsed bar shows the author's name, @handle, and a blue or gold verified badge.
 - **Settings panel.** Turn each filter on or off, set its own threshold, choose collapse or remove, test your connection, and see how much you've spent.
 - **Leaves you alone.** Your own posts are never classified or hidden.
-- **Cheap.** Under **1¢ per 1,000 posts** on hosted Jev (see [Efficiency](#efficiency)). Every score is cached, and paid ads never reach the AI.
+- **Cheap.** About **half a cent per 1,000 posts** on hosted Jev (see [Efficiency](#efficiency)). Every score is cached, and paid ads never reach the AI.
 
 ## Install
 
@@ -68,22 +68,33 @@ Open **Tampermonkey menu → Settings** on x.com:
 
 1. A `MutationObserver` watches the timeline for posts (`article[data-testid="tweet"]`).
 2. Posts carrying X's "Ad" label are collapsed right away.
-3. Every other post is queued and sent in batches of up to 16 to your System One endpoint. Each post carries its text, the author's display name, and whether the account is unverified, verified, or a verified organization (gold check).
-4. The request's `state` holds a definition of each filter once (bait comes with a few sample posts). Each post gets one short yes/no (`noul`) question per filter: ``Is `post_3` `definitions.engagement_bait`?``
-5. Jev returns a probability per post per filter. Results are cached, and anything at or above a filter's threshold is collapsed.
+3. Every other post is queued and sent in batches of up to 32 to your System One endpoint. A full batch goes out immediately; otherwise whatever has queued up is sent after 350 ms. Your own posts are skipped.
+4. Each post is one compact string with the author's display name and account type (unverified, verified, or verified organization from the gold check): `Acme [verified organization]: Introducing…`
+5. The request's `state` holds the definition of each *enabled* filter once (bait comes with a few sample posts). Each post gets one short yes/no (`noul`) question per enabled filter: ``Is `post_3` `definitions.engagement_bait`?``
+6. Jev returns a probability per post per filter. Results are cached, and anything at or above a filter's threshold is collapsed. If you turn a filter on later, only that missing question is asked for posts already seen.
+7. If the endpoint is down or rejects the key, posts are kept and sent again after a 60-second cooldown or once you fix the settings.
 
 ## Efficiency
 
-Jev bills input tokens only, counting the state and every question. Questions run in parallel, so packing many into one request is fast. The catch is repetition: if every question restates the full definition, the question text costs more than the posts. We benchmarked four layouts on the same 82 labeled posts (62 bait from [`twitter-bait-questions.txt`](twitter-bait-questions.txt), 10 promo, 10 ordinary) at the default 60% threshold:
+Jev bills input tokens only, counting the state and every question. Questions run in parallel, so packing many into one request is fast; what costs tokens is repetition and formatting. All layouts below were benchmarked on the same 82 labeled posts (62 bait from [`twitter-bait-questions.txt`](twitter-bait-questions.txt), 10 promo, 10 ordinary) at the default 60% threshold:
 
 | Layout | Tokens / post | $ / 1k posts | Bait caught | Promo caught | False flags |
 | --- | --- | --- | --- | --- | --- |
 | Full definition in every question, 8 posts/request (v2.0) | 436 | $0.018 | 62/62 | 10/10 | 1 |
-| Definitions once in state, 8 posts/request | 184 | $0.008 | 62/62 | 10/10 | 0 |
-| **Definitions once in state, 16 posts/request (current)** | **144** | **$0.006** | **62/62** | **10/10** | **0** |
-| Full definition, 1 post/request | 798 | $0.034 | 61/62 | 10/10 | 1 |
+| Definitions once in state, 16 posts/request (v2.2) | 144 | $0.006 | 62/62 | 10/10 | 0 |
+| + each post as one compact string | 126 | $0.0053 | 62/62 | 10/10 | 0 |
+| **+ up to 32 posts/request (current)** | **103** | **$0.0043** | **62/62** | **10/10** | **0** |
 
-The current layout is about **3x cheaper** than v2.0 with no accuracy loss. Bigger batches cost less per post, but each extra post is more unrelated text in the state, which can hurt Jev's accuracy, so the batch size is capped at 16. The promo filter correctly left alone news from organization accounts (Reuters, NASA).
+Tried and rejected:
+
+| Layout | Tokens / post | Bait caught | Promo caught | False flags | Why it was rejected |
+| --- | --- | --- | --- | --- | --- |
+| Posts in an array, questions ask about `posts[3]` | 120 | 61/62 | 9/10 | 5 | Jev mixes up which post is meant |
+| Same, 24 or 32 per request | 96–104 | 61/62 | 5–8/10 | 9–12 | Worse still |
+| Compact strings without the bait examples | 115 | 62/62 | 10/10 | 1 | Weaker bait signal (lowest bait score 0.80 → 0.65) |
+| Full definition, 1 post per request | 798 | 61/62 | 10/10 | 1 | Most expensive |
+
+The current layout is **over 4x cheaper** than v2.0 with no accuracy loss. Turning a filter off also removes its definition and questions from every request. The promo filter correctly left alone news from organization accounts (Reuters, NASA).
 
 ## Privacy
 

@@ -1,70 +1,80 @@
-# X Bait Post Filter
+# Tolerable X Feed
 
 **Are you tired of pretentious engagement-bait posts on X?**
 
 > *"You wake up in 1999 with a laptop and a coding agent. What do you ship first?"*
 > *"Name one engineer who writes better code than an LLM."*
-> *"Be honest: are you using AI to code faster, or because you forgot how to code?"*
+> *"Major release is live today 🚀 $0.11 per 1M tokens, try it now →"*
 
-Same here. This Tampermonkey userscript reads your timeline and collapses posts that exist only to farm replies. It uses [Jev](https://openrouter.ai/typesafe/jev-1.13), TypeSafe's decision model on OpenRouter, to give each post a bait probability from 0 to 1. Posts above your threshold get folded away.
+Same here. Tolerable X Feed is a Tampermonkey userscript that reads your timeline and folds away the posts that exist only to farm replies or sell you something:
 
-![Bait posts collapsed in the timeline](screenshots/collapsed.png)
+| Filter | Catches | How |
+| --- | --- | --- |
+| **Bait** | "Name one…", "You wake up in 1999…", "Be honest:…", would-you-rather and hot-take polls | AI ([Jev](https://openrouter.ai/typesafe/jev-1.13)) |
+| **Promo** | Product launches, pricing drops, discount codes, webinars, Product Hunt begging, "try it now" links | AI ([Jev](https://openrouter.ai/typesafe/jev-1.13)) |
+| **Ad** | Paid posts X labels as "Ad" | Read from the page, free |
+
+![Filtered posts collapsed in the timeline](screenshots/collapsed.png)
 
 Changed your mind? Click **Show** to open a post. It gets a light amber tint so you know it was flagged, and **Hide** folds it back.
 
-![Revealed bait posts with a tint and a Hide button](screenshots/revealed.png)
+![Revealed posts with a tint and a Hide button](screenshots/revealed.png)
 
 ## Features
 
-- **Classifies by meaning, not keywords.** It catches open-ended hypotheticals, "name one…", "would you rather", "be honest:" and hot-take polls, and leaves real questions, news, releases and jokes alone.
-- **Shows who posted it.** The collapsed bar shows the author's name, @handle and verified badge.
-- **Collapse or hide.** Keep a slim bar with Show/Hide, or remove bait posts completely.
-- **Cheap.** Posts are sent 8 per request, and every score is cached, so the same post is never paid for twice. That comes to roughly **$0.01 per 1,000 posts**.
-- **Adjustable.** Set the threshold, turn on score badges for tuning, pause it, or clear the cache from the Tampermonkey menu.
+- **Classifies by meaning, not keywords.** Jev, TypeSafe's decision model, scores every post from 0 to 1 for each filter. Real questions, news, research, releases you'd want to know about, and jokes stay in your feed.
+- **Shows who posted it.** The collapsed bar shows the author's name, @handle, and a blue or gold verified badge.
+- **Settings panel.** Turn each filter on or off, set its own threshold, choose collapse or remove, and see how much you've spent.
+- **Cheap.** Posts are sent 8 per request, every score is cached, and paid ads never reach the AI. That comes to roughly **1–2¢ per 1,000 posts**.
 
 ## Install
 
 1. Install [Tampermonkey](https://www.tampermonkey.net/) (or Violentmonkey).
-2. Open **[x-bait-filter.user.js](https://raw.githubusercontent.com/nikkoxgonzales/x-bait-filter/main/x-bait-filter.user.js)**. Tampermonkey will offer to install it.
+2. Open **[tolerable-x-feed.user.js](https://raw.githubusercontent.com/nikkoxgonzales/tolerable-x-feed/main/tolerable-x-feed.user.js)**. Tampermonkey will offer to install it.
 3. Get an API key at [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys) and add a few dollars of credit. A dollar goes a long way.
-4. Open [x.com](https://x.com). The script asks for your key on first run.
+4. Open [x.com](https://x.com). The settings panel opens on first run so you can paste your key.
 
 Updates are picked up automatically through Tampermonkey's update check.
 
 ## Settings
 
-Everything is in the Tampermonkey menu while you're on x.com:
+Open **Tampermonkey menu → Settings** on x.com:
 
-| Menu item | What it does |
-| --- | --- |
-| Set OpenRouter API key | Saves your key in Tampermonkey's local storage |
-| Set threshold | Hides posts scoring at or above this value. Default `0.6`; lower is stricter |
-| Toggle mode (collapse / hide) | `collapse` keeps a bar with Show/Hide; `hide` removes the post entirely |
-| Toggle score badges | Shows `bait 0.12` on every post, which helps when picking a threshold |
-| Pause / resume filtering | Turns the filter off without uninstalling |
-| Clear verdict cache | Forgets all cached scores |
+- **Filters.** Toggle Ad, Bait, and Promo separately. Each AI filter has a threshold slider (default 60%): a post is hidden when its score is at or above it, so lower means stricter.
+- **Display.** *Collapse* keeps a slim bar with Show/Hide; *Remove completely* takes the post out of the feed.
+- **Score badges.** Shows `bait 0.12 · promo 0.03` on every post, which helps when picking thresholds.
+- **API key** and **Clear cache**.
+
+**Tampermonkey menu → Pause / resume** switches everything off without uninstalling.
 
 ## How it works
 
 1. A `MutationObserver` watches the timeline for posts (`article[data-testid="tweet"]`).
-2. New post text is queued and sent in batches to OpenRouter's [Decisions API](https://openrouter.ai/docs/guides/community/jev) (`POST /api/alpha/decisions`), with one yes/no (`noul`) question per post: *is this engagement bait?* A few sample bait posts are sent along as examples.
-3. Jev returns a probability per post. Results are cached by a hash of the post text, and anything at or above the threshold is collapsed.
+2. Posts carrying X's "Ad" label are collapsed right away.
+3. Every other post is queued and sent in batches to OpenRouter's [Decisions API](https://openrouter.ai/docs/guides/community/jev) (`POST /api/alpha/decisions`). Each post carries its text, the author's display name, and whether the account is unverified, verified, or a verified organization (gold check), and gets one yes/no (`noul`) question per filter. A few sample bait posts go along as examples.
+4. Jev returns a probability per post per filter. Results are cached, and anything at or above a filter's threshold is collapsed.
 
-On the sample set in [`twitter-bait-questions.txt`](twitter-bait-questions.txt), the default threshold caught 61–62 of 62 bait posts, with no false positives on a set of ordinary posts (release notes, news, genuine help questions, jokes).
+**Accuracy** on a test set of 82 posts (the bait in [`twitter-bait-questions.txt`](twitter-bait-questions.txt), 10 promo posts, and 10 ordinary posts) at the default 60% threshold:
+
+| | Flagged as bait | Flagged as promo |
+| --- | --- | --- |
+| Bait posts (62) | 62 | 0 |
+| Promo posts (10) | 0 | 10 |
+| Ordinary posts (10) | 1 ("Hot take: …", fair enough) | 0 |
+
+News from organization accounts (Reuters, NASA) was correctly left alone by the promo filter.
 
 ## Privacy
 
-- Post text from your timeline is sent to OpenRouter and TypeSafe to be classified. Nothing else is: no usernames, no account info, no browsing data.
+- Post text, author display name, and verification type are sent to OpenRouter and TypeSafe to be classified. No @handles, account info, or browsing data are sent.
 - Your API key stays in your browser's Tampermonkey storage and is only sent to `openrouter.ai`.
 
 ## Tuning
 
-Seeing bait slip through, or good posts getting hidden?
+- Turn on **score badges**, see where your timeline sits, and adjust the thresholds.
+- Edit `BAIT_EXAMPLES` or a filter's `question()` wording near the top of the script to fit what you see. Adding a new AI filter means adding one more entry to `FILTERS`.
 
-- Turn on **score badges** and see where your timeline sits, then adjust the **threshold**.
-- Edit the `EXAMPLES` array or the `question()` wording at the top of the script to fit the kind of bait you see.
-
-If X changes its markup and the script stops finding posts, please [open an issue](https://github.com/nikkoxgonzales/x-bait-filter/issues).
+If X changes its markup and the script stops finding posts or ads, please [open an issue](https://github.com/nikkoxgonzales/tolerable-x-feed/issues).
 
 ## License
 
